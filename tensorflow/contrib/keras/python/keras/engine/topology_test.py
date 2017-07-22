@@ -195,13 +195,13 @@ class TopologyConstructionTest(test.TestCase):
     self.assertEqual(test_layer.output_shape, (None, 16))
 
     # pylint: disable=pointless-statement
-    with self.assertRaises(Exception):
+    with self.assertRaises(AttributeError):
       dense.input
-    with self.assertRaises(Exception):
+    with self.assertRaises(AttributeError):
       dense.output
-    with self.assertRaises(Exception):
+    with self.assertRaises(AttributeError):
       dense.input_mask
-    with self.assertRaises(Exception):
+    with self.assertRaises(AttributeError):
       dense.output_mask
     # pylint: enable=pointless-statement
 
@@ -490,8 +490,8 @@ class TopologyConstructionTest(test.TestCase):
     m, n = model([j, k])
     tf_model = keras.models.Model([j, k], [m, n])
 
-    j_tf = array_ops.placeholder(dtype=dtypes.float32)
-    k_tf = array_ops.placeholder(dtype=dtypes.float32)
+    j_tf = array_ops.placeholder(dtype=dtypes.float32, shape=(None, 32))
+    k_tf = array_ops.placeholder(dtype=dtypes.float32, shape=(None, 32))
     m_tf, n_tf = tf_model([j_tf, k_tf])
     self.assertListEqual(m_tf.get_shape().as_list(), [None, 64])
     self.assertListEqual(n_tf.get_shape().as_list(), [None, 5])

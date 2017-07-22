@@ -13,7 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Variables. See the @{python/state_ops} guide.
+"""Variables. See the @{$python/state_ops} guide.
 
 @@Variable
 @@global_variables
@@ -46,10 +46,13 @@
 @@random_normal_initializer
 @@truncated_normal_initializer
 @@random_uniform_initializer
-@@uniform_unit_scaling_initializer
+@@glorot_uniform_initializer
+@@glorot_normal_initializer
 @@zeros_initializer
 @@ones_initializer
 @@orthogonal_initializer
+@@variance_scaling_initializer
+@@uniform_unit_scaling_initializer
 @@fixed_size_partitioner
 @@variable_axis_size_partitioner
 @@min_max_variable_partitioner
@@ -209,7 +212,7 @@ def assign_sub(ref, value, use_locking=None, name=None):
   if ref.dtype._is_ref_dtype:
     return gen_state_ops.assign_sub(
         ref, value, use_locking=use_locking, name=name)
-  return ref.assign_sub(value, name=name)
+  return ref.assign_sub(value)
 
 
 def assign_add(ref, value, use_locking=None, name=None):
@@ -237,7 +240,7 @@ def assign_add(ref, value, use_locking=None, name=None):
   if ref.dtype._is_ref_dtype:
     return gen_state_ops.assign_add(
         ref, value, use_locking=use_locking, name=name)
-  return ref.assign_add(value, name=name)
+  return ref.assign_add(value)
 
 
 def assign(ref, value, validate_shape=None, use_locking=None, name=None):
@@ -269,4 +272,4 @@ def assign(ref, value, validate_shape=None, use_locking=None, name=None):
     return gen_state_ops.assign(
         ref, value, use_locking=use_locking, name=name,
         validate_shape=validate_shape)
-  return ref.assign(value, name=name)
+  return ref.assign(value)

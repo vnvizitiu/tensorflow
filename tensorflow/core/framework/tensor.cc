@@ -29,8 +29,11 @@ limitations under the License.
 
 #include "tensorflow/core/framework/tensor.h"
 
+#include "tensorflow/core/framework/allocation_description.pb.h"
 #include "tensorflow/core/framework/log_memory.h"
+#include "tensorflow/core/framework/resource_handle.pb.h"
 #include "tensorflow/core/framework/tensor.pb.h"
+#include "tensorflow/core/framework/tensor_description.pb.h"
 #include "tensorflow/core/framework/type_traits.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/coding.h"
@@ -51,7 +54,7 @@ namespace {
 // An un-templated base class for Buffer.
 class BufferBase : public TensorBuffer {
  public:
-  BufferBase(Allocator* alloc) : alloc_(alloc) {}
+  explicit BufferBase(Allocator* alloc) : alloc_(alloc) {}
 
   TensorBuffer* root_buffer() override { return this; }
   void FillAllocationDescription(AllocationDescription* proto) const override {
@@ -270,7 +273,7 @@ struct ProtoHelper<int64> {
 
 template <>
 struct ProtoHelper<ResourceHandle> {
-  static protobuf::RepeatedPtrField<ResourceHandle>::const_iterator Begin(
+  static protobuf::RepeatedPtrField<ResourceHandleProto>::const_iterator Begin(
       const TensorProto& proto) {
     return proto.resource_handle_val().begin();
   }
@@ -278,8 +281,11 @@ struct ProtoHelper<ResourceHandle> {
     return proto.resource_handle_val().size();
   }
   static void Fill(const ResourceHandle* data, size_t n, TensorProto* proto) {
-    protobuf::RepeatedPtrField<ResourceHandle> copy(data, data + n);
-    proto->mutable_resource_handle_val()->Swap(&copy);
+    auto* handles = proto->mutable_resource_handle_val();
+    handles->Clear();
+    for (size_t i = 0; i < n; i++) {
+      data[i].AsProto(handles->Add());
+    }
   }
 };
 
@@ -370,10 +376,10 @@ Buffer<T>::Buffer(Allocator* a, int64 n,
 
 template <typename T>
 Buffer<T>::~Buffer() {
-  if (LogMemory::IsEnabled()) {
-    RecordDeallocation();
-  }
   if (data_) {
+    if (LogMemory::IsEnabled()) {
+      RecordDeallocation();
+    }
     alloc_->Deallocate<T>(data_, elem_);
   }
 }
@@ -902,42 +908,27 @@ void Tensor::FillDescription(TensorDescription* description) const {
 }
 
 gtl::InlinedVector<int64, 4> Tensor::ComputeFlatInnerDims(
-    int64 num_out_dims) const {
-  if (num_out_dims == dims()) {
-    return shape_.dim_sizes();
-  }
+    gtl::ArraySlice<int64> orig, int64 num_out_dims) {
   gtl::InlinedVector<int64, 4> out_dims(num_out_dims, 0);
-  const int64 num_elements = NumElements();
-  int64 prod_out_dims = 1;
-  for (int64 out_dim = num_out_dims - 1; out_dim > 0; --out_dim) {
-    const int64 in_dim = out_dim + (dims() - num_out_dims);
-    out_dims[out_dim] = (in_dim >= dims() || in_dim < 0) ? 1 : dim_size(in_dim);
-    prod_out_dims *= out_dims[out_dim];
+  int64 offset = orig.size() - num_out_dims;
+  for (int64 out_dim = num_out_dims - 1; out_dim >= 0; --out_dim) {
+    const int64 in_dim = out_dim + offset;
+    out_dims[out_dim] = in_dim < 0 ? 1 : orig[in_dim];
   }
-  if (prod_out_dims != 0) {
-    out_dims[0] = num_elements / prod_out_dims;
-  } else {
-    out_dims[0] = 0;
+  for (int64 in_dim = 0; in_dim < offset; ++in_dim) {
+    out_dims[0] *= orig[in_dim];
   }
   return out_dims;
 }
 
 gtl::InlinedVector<int64, 4> Tensor::ComputeFlatOuterDims(
-    int64 num_out_dims) const {
-  if (num_out_dims == dims()) {
-    return shape_.dim_sizes();
-  }
+    gtl::ArraySlice<int64> orig, int64 num_out_dims) {
   gtl::InlinedVector<int64, 4> out_dims(num_out_dims, 0);
-  const int64 num_elements = NumElements();
-  int64 prod_out_dims = 1;
-  for (int64 out_dim = 0; out_dim < num_out_dims - 1; ++out_dim) {
-    out_dims[out_dim] = out_dim >= dims() ? 1 : dim_size(out_dim);
-    prod_out_dims *= out_dims[out_dim];
+  for (int64 out_dim = 0; out_dim <= num_out_dims - 1; ++out_dim) {
+    out_dims[out_dim] = out_dim >= orig.size() ? 1 : orig[out_dim];
   }
-  if (prod_out_dims != 0) {
-    out_dims[num_out_dims - 1] = num_elements / prod_out_dims;
-  } else {
-    out_dims[num_out_dims - 1] = 0;
+  for (int64 in_dim = num_out_dims; in_dim < orig.size(); ++in_dim) {
+    out_dims[num_out_dims - 1] *= orig[in_dim];
   }
   return out_dims;
 }

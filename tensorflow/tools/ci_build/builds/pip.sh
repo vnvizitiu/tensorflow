@@ -23,7 +23,7 @@
 #
 # When executing the Python unit tests, the script obeys the shell
 # variables: TF_BUILD_BAZEL_CLEAN, TF_BUILD_INSTALL_EXTRA_PIP_PACKAGES,
-# NO_TEST_ON_INSTALL
+# NO_TEST_ON_INSTALL, PIP_TEST_ROOT
 #
 # TF_BUILD_BAZEL_CLEAN, if set to any non-empty and non-0 value, directs the
 # script to perform bazel clean prior to main build and test steps.
@@ -40,6 +40,9 @@
 #
 # If NO_TEST_TFDBG_BINARIES has any non-empty and non-0 value, the testing of
 # TensorFlow Debugger (tfdbg) binaries and examples will be skipped.
+#
+# If PIP_TEST_ROOT has a non-empty and a non-0 value, the whl files will be
+# placed in that directory.
 #
 # Any flags not listed in the usage above will be passed directly to Bazel.
 #
@@ -162,7 +165,10 @@ echo "Python binary path to be used in PIP install: ${PYTHON_BIN_PATH} "\
 "(Major.Minor version: ${PY_MAJOR_MINOR_VER})"
 
 # Build PIP Wheel file
-PIP_TEST_ROOT="pip_test"
+# Set default pip file folder unless specified by env variable
+if [ -z "$PIP_TEST_ROOT" ]; then
+  PIP_TEST_ROOT="pip_test"
+fi
 PIP_WHL_DIR="${PIP_TEST_ROOT}/whl"
 PIP_WHL_DIR=$(realpath ${PIP_WHL_DIR})  # Get absolute path
 rm -rf ${PIP_WHL_DIR} && mkdir -p ${PIP_WHL_DIR}
@@ -205,14 +211,17 @@ if [[ -n "${PY_TAGS}" ]]; then
 $(echo ${WHL_BASE_NAME} | cut -d \- -f 2)-${PY_TAGS}-${PLATFORM_TAG}.whl
 
   if [[ ! -f "${WHL_DIR}/${NEW_WHL_BASE_NAME}" ]]; then
-    cp "${WHL_DIR}/${WHL_BASE_NAME}" "${WHL_DIR}/${NEW_WHL_BASE_NAME}" && \
-      echo "Copied wheel file: ${WHL_BASE_NAME} --> ${NEW_WHL_BASE_NAME}" || \
+    if cp "${WHL_DIR}/${WHL_BASE_NAME}" "${WHL_DIR}/${NEW_WHL_BASE_NAME}"
+    then
+      echo "Copied wheel file: ${WHL_BASE_NAME} --> ${NEW_WHL_BASE_NAME}"
+    else
       die "ERROR: Failed to copy wheel file to ${NEW_WHL_BASE_NAME}"
+    fi
   fi
 fi
 
 if [[ $(uname) == "Linux" ]]; then
-  AUDITED_WHL_NAME="${WHL_DIR}/$(echo ${WHL_BASE_NAME} | sed "s/linux/manylinux1/")"
+  AUDITED_WHL_NAME="${WHL_DIR}/$(echo ${WHL_BASE_NAME//linux/manylinux1})"
 
   # Repair the wheels for cpu manylinux1
   if [[ ${CONTAINER_TYPE} == "cpu" ]]; then
@@ -233,46 +242,101 @@ if [[ $(uname) == "Linux" ]]; then
   fi
 fi
 
-# Perform installation
-echo "Installing pip whl file: ${WHL_PATH}"
+
+create_activate_virtualenv_and_install_tensorflow() {
+  # Create and activate a virtualenv; then install tensorflow pip package in it.
+  #
+  # Usage:
+  #   create_activate_virtualenv_and_install_tensorflow [--clean] \
+  #       <VIRTUALENV_DIR> <TF_WHEEL_PATH>
+  #
+  # Arguments:
+  #   --clean: Create a clean virtualenv, i.e., without --system-site-packages.
+  #   VIRTUALENV_DIR: virtualenv directory to be created.
+  #   TF_WHEEL_PATH: Path to the tensorflow wheel file to be installed in the
+  #     virtualenv.
+
+  VIRTUALENV_FLAGS="--system-site-packages"
+  if [[ "$1" == "--clean" ]]; then
+    VIRTUALENV_FLAGS=""
+    shift
+  fi
+
+  VIRTUALENV_DIR="$1"
+  TF_WHEEL_PATH="$2"
+  if [[ -d "${VIRTUALENV_DIR}" ]]; then
+    if rm -rf "${VIRTUALENV_DIR}"
+    then
+      echo "Removed existing virtualenv directory: ${VIRTUALENV_DIR}"
+    else
+      die "Failed to remove existing virtualenv directory: ${VIRTUALENV_DIR}"
+    fi
+  fi
+
+  if mkdir -p "${VIRTUALENV_DIR}"
+  then
+    echo "Created virtualenv directory: ${VIRTUALENV_DIR}"
+  else
+    die "FAILED to create virtualenv directory: ${VIRTUALENV_DIR}"
+  fi
+
+  # Verify that virtualenv exists
+  if [[ -z $(which virtualenv) ]]; then
+    die "FAILED: virtualenv not available on path"
+  fi
+
+  virtualenv ${VIRTUALENV_FLAGS} \
+    -p "${PYTHON_BIN_PATH}" "${VIRTUALENV_DIR}" || \
+    die "FAILED: Unable to create virtualenv"
+
+  source "${VIRTUALENV_DIR}/bin/activate" || \
+    die "FAILED: Unable to activate virtualenv in ${VIRTUALENV_DIR}"
+
+  # Install the pip file in virtual env.
+
+  # Upgrade pip so it supports tags such as cp27mu, manylinux1 etc.
+  echo "Upgrade pip in virtualenv"
+  pip install --upgrade pip==8.1.2
+
+  # Force tensorflow reinstallation. Otherwise it may not get installed from
+  # last build if it had the same version number as previous build.
+  PIP_FLAGS="--upgrade --force-reinstall"
+  pip install -v ${PIP_FLAGS} ${WHL_PATH} || \
+    die "pip install (forcing to reinstall tensorflow) FAILED"
+  echo "Successfully installed pip package ${TF_WHEEL_PATH}"
+}
+
+
+# 1. Smoke test of tensorflow install in clean virtualenv
+echo
+echo "Installing and smoke-testing pip wheel in clean virtualenv: ${WHL_PATH}"
+echo
+
+CLEAN_VENV_DIR="${PIP_TEST_ROOT}/venv_clean"
+create_activate_virtualenv_and_install_tensorflow --clean \
+  "${CLEAN_VENV_DIR}" "${WHL_PATH}"
+# cd to a temporary directory to avoid picking up Python files in the source
+# tree.
+TMP_DIR=$(mktemp -d)
+pushd "${TMP_DIR}"
+[[ $(python -c "import tensorflow as tf; print(tf.Session().run(tf.constant(42)))") == 42 ]] \
+  && echo "Smoke test of tensorflow install in clean virtualenv PASSED." \
+  || die "Smoke test of tensroflow install in clean virtualenv FAILED."
+deactivate || \
+  die "FAILED: Unable to deactivate virtualenv from ${CLEAN_VENV_DIR}"
+popd
+rm -rf "${TMP_DIR}" "${CLEAN_VENV_DIR}"
+
+# 2. Perform installation of tensorflow in "non-clean" virtualenv and tests
+# against the install.
+echo
+echo "Installing and testing pip wheel in virtualenv: ${WHL_PATH}"
+echo
 
 # Create virtualenv directory for install test
 VENV_DIR="${PIP_TEST_ROOT}/venv"
-
-if [[ -d "${VENV_DIR}" ]]; then
-  rm -rf "${VENV_DIR}" && \
-      echo "Removed existing virtualenv directory: ${VENV_DIR}" || \
-      die "Failed to remove existing virtualenv directory: ${VENV_DIR}"
-fi
-
-mkdir -p ${VENV_DIR} && \
-    echo "Created virtualenv directory: ${VENV_DIR}" || \
-    die "FAILED to create virtualenv directory: ${VENV_DIR}"
-
-# Verify that virtualenv exists
-if [[ -z $(which virtualenv) ]]; then
-  die "FAILED: virtualenv not available on path"
-fi
-
-virtualenv --system-site-packages -p "${PYTHON_BIN_PATH}" "${VENV_DIR}" || \
-    die "FAILED: Unable to create virtualenv"
-
-source "${VENV_DIR}/bin/activate" || \
-    die "FAILED: Unable to activate virtualenv"
-
-
-# Install the pip file in virtual env (plus missing dependencies)
-
-# Upgrade pip so it supports tags such as cp27mu, manylinux1 etc.
-echo "Upgrade pip in virtualenv"
-pip install --upgrade pip==8.1.2
-
-# Force tensorflow reinstallation. Otherwise it may not get installed from
-# last build if it had the same version number as previous build.
-PIP_FLAGS="--upgrade --force-reinstall"
-pip install -v ${PIP_FLAGS} ${WHL_PATH} || \
-    die "pip install (forcing to reinstall tensorflow) FAILED"
-echo "Successfully installed pip package ${WHL_PATH}"
+create_activate_virtualenv_and_install_tensorflow \
+  "${CLEAN_VENV_DIR}" "${WHL_PATH}"
 
 # Install extra pip packages required by the test-on-install
 for PACKAGE in ${INSTALL_EXTRA_PIP_PACKAGES}; do
@@ -328,5 +392,4 @@ if [[ "${DO_INTEGRATION_TESTS}" == "1" ]]; then
       die "Integration tests on install FAILED"
 fi
 
-deactivate || \
-    die "FAILED: Unable to deactivate virtualenv"
+deactivate || die "FAILED: Unable to deactivate virtualenv from ${VENV_DIR}"

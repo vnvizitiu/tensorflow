@@ -24,15 +24,16 @@ from tensorflow.python.framework import ops
 from tensorflow.python.framework import tensor_shape
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import control_flow_ops
+from tensorflow.python.ops import gen_array_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import state_ops
 from tensorflow.python.util import compat
+from tensorflow.python.util import tf_should_use
 from tensorflow.python.util.deprecation import deprecated
 
 
 class Variable(object):
-  """See the @{$variables$Variables How To} for a high
-  level overview.
+  """See the @{$variables$Variables How To} for a high level overview.
 
   A variable maintains state in the graph across calls to `run()`. You add a
   variable to the graph by constructing an instance of the class `Variable`.
@@ -280,11 +281,20 @@ class Variable(object):
                 shape,
                 self._initial_value.dtype.base_dtype,
                 name=name)
+          # pylint: enable=protected-access
 
         # Or get the initial value from a Tensor or Python object.
         else:
           self._initial_value = ops.convert_to_tensor(
               initial_value, name="initial_value", dtype=dtype)
+          # pylint: disable=protected-access
+          if self._initial_value.op._get_control_flow_context() is not None:
+            raise ValueError(
+                "Initializer for variable %s is from inside a control-flow "
+                "construct, such as a loop or conditional. When creating a "
+                "variable inside a loop or conditional, use a lambda as the "
+                "initializer." % name)
+          # pylint: enable=protected-access
           shape = (self._initial_value.get_shape()
                    if validate_shape else tensor_shape.unknown_shape())
           # In this case, the variable op can't be created until after the
@@ -301,9 +311,12 @@ class Variable(object):
             raise ValueError("initial_value must have a shape specified: %s" %
                              self._initial_value)
 
-        # Assigns initial value.
+        # If 'initial_value' makes use of other variables, make sure we don't
+        # have an issue if these other variables aren't initialized first by
+        # using their initialized_value() method.
         self._initializer_op = state_ops.assign(
-            self._variable, self._initial_value,
+            self._variable,
+            self._build_initializer_expr(self._initial_value),
             validate_shape=validate_shape).op
 
         # TODO(vrv): Change this class to not take caching_device, but
@@ -568,6 +581,29 @@ class Variable(object):
         sparse_delta.values,
         use_locking=use_locking)
 
+  def _strided_slice_assign(self,
+                            begin,
+                            end,
+                            strides,
+                            value,
+                            name,
+                            begin_mask,
+                            end_mask,
+                            ellipsis_mask,
+                            new_axis_mask,
+                            shrink_axis_mask):
+    return gen_array_ops.strided_slice_assign(ref=self._ref(),
+                                              begin=begin,
+                                              end=end,
+                                              strides=strides,
+                                              value=value,
+                                              name=name,
+                                              begin_mask=begin_mask,
+                                              end_mask=end_mask,
+                                              ellipsis_mask=ellipsis_mask,
+                                              new_axis_mask=new_axis_mask,
+                                              shrink_axis_mask=shrink_axis_mask)
+
   def count_up_to(self, limit):
     """Increments this variable until it reaches `limit`.
 
@@ -674,6 +710,89 @@ class Variable(object):
       pass
 
     setattr(Variable, operator, _run_op)
+
+  def _build_initializer_expr(self, initial_value):
+    """Build an expression suitable to initialize a variable.
+
+    Replace references to variables in initial_value with references to the
+    variable initial values instead.
+
+    Args:
+      initial_value: original expression
+    Returns:
+      A tensorflow expression suitable to initialize a variable.
+    """
+    if isinstance(initial_value, Variable):
+      return initial_value.initialized_value()
+    elif isinstance(initial_value, ops.Tensor):
+      new_op = self._build_initializer_expr(initial_value.op)
+      if new_op != initial_value.op:
+        if isinstance(new_op, ops.Tensor):
+          return new_op
+        else:
+          return ops.Tensor(new_op, initial_value.value_index,
+                            initial_value.dtype)
+      else:
+        return initial_value
+    elif isinstance(initial_value, ops.Operation):
+      if initial_value.node_def.op in [
+          "IsVariableInitialized", "VarIsInitializedOp", "ReadVariableOp"
+      ]:
+        return initial_value
+      if initial_value.node_def.op in ["Variable", "VariableV2", "VarHandleOp"]:
+        return self._find_initialized_value_for_variable(initial_value)
+      modified = False
+      new_inputs = []
+      for tensor in initial_value.inputs:
+        new_tensor = self._build_initializer_expr(tensor)
+        new_inputs.append(new_tensor)
+        if new_tensor != tensor:
+          modified = True
+
+      if modified:
+        new_name = initial_value.node_def.name + "_" + self.name
+        new_name = new_name.replace(":", "_")
+        new_op = initial_value.node_def.op
+        new_op = new_op.replace("RefSwitch", "Switch")
+        new_value = self.graph.create_op(
+            new_op,
+            new_inputs,
+            # pylint: disable=protected-access
+            initial_value._output_types,
+            # pylint: enable=protected-access
+            name=new_name,
+            attrs=initial_value.node_def.attr)
+        return new_value
+      else:
+        return initial_value
+    else:
+      return initial_value
+
+  def _find_initialized_value_for_variable(self, variable_op):
+    """Find the initial value for a variable op.
+
+    To do so, lookup the variable op in the variables collection.
+
+    Args:
+      variable_op: a TensorFlow variable Operation
+    Returns:
+      The initial value for the variable.
+    """
+    try:
+      var_names = [variable_op.node_def.name, variable_op.node_def.name + ":0"]
+      global_vars = self.graph.get_collection(ops.GraphKeys.GLOBAL_VARIABLES)
+      for var in global_vars:
+        if var.name in var_names:
+          return var.initialized_value()
+      local_vars = self.graph.get_collection(ops.GraphKeys.LOCAL_VARIABLES)
+      for var in local_vars:
+        if var.name == var_names:
+          return var.initialized_value()
+    except AttributeError:
+      # Return the variable itself when an incomplete user defined variable type
+      # was put in the collection.
+      return variable_op
+    return variable_op
 
   # NOTE(mrry): This enables the Variable's overloaded "right" binary
   # operators to run when the left operand is an ndarray, because it
@@ -1152,6 +1271,7 @@ def variables_initializer(var_list, name="init"):
   return control_flow_ops.no_op(name=name)
 
 
+@tf_should_use.should_use_result
 @deprecated("2017-03-02", "Use `tf.variables_initializer` instead.")
 def initialize_variables(var_list, name="init"):
   """See `tf.variables_initializer`."""
@@ -1161,7 +1281,7 @@ def initialize_variables(var_list, name="init"):
 def global_variables_initializer():
   """Returns an Op that initializes global variables.
 
-  This is just a shortcut for `variable_initializer(global_variables())`
+  This is just a shortcut for `variables_initializer(global_variables())`
 
   Returns:
     An Op that initializes global variables in the graph.
@@ -1169,6 +1289,7 @@ def global_variables_initializer():
   return variables_initializer(global_variables())
 
 
+@tf_should_use.should_use_result
 @deprecated("2017-03-02", "Use `tf.global_variables_initializer` instead.")
 def initialize_all_variables():
   """See `tf.global_variables_initializer`."""
@@ -1178,7 +1299,7 @@ def initialize_all_variables():
 def local_variables_initializer():
   """Returns an Op that initializes all local variables.
 
-  This is just a shortcut for `variable_initializer(local_variables())`
+  This is just a shortcut for `variables_initializer(local_variables())`
 
   Returns:
     An Op that initializes all local variables in the graph.
@@ -1186,12 +1307,14 @@ def local_variables_initializer():
   return variables_initializer(local_variables())
 
 
+@tf_should_use.should_use_result
 @deprecated("2017-03-02", "Use `tf.local_variables_initializer` instead.")
 def initialize_local_variables():
   """See `tf.local_variables_initializer`."""
   return local_variables_initializer()
 
 
+@tf_should_use.should_use_result
 def is_variable_initialized(variable):
   """Tests if a variable has been initialized.
 
@@ -1205,6 +1328,7 @@ def is_variable_initialized(variable):
   return state_ops.is_variable_initialized(variable)
 
 
+@tf_should_use.should_use_result
 def assert_variables_initialized(var_list=None):
   """Returns an Op to check if variables are initialized.
 
@@ -1246,6 +1370,7 @@ def assert_variables_initialized(var_list=None):
       return array_ops.stack(ranks)
 
 
+@tf_should_use.should_use_result
 def report_uninitialized_variables(var_list=None,
                                    name="report_uninitialized_variables"):
   """Adds ops to list the names of uninitialized variables.
@@ -1271,23 +1396,25 @@ def report_uninitialized_variables(var_list=None,
         if op.type in ["Variable", "VariableV2", "AutoReloadVariable"]:
           var_list.append(op.outputs[0])
   with ops.name_scope(name):
-    if not var_list:
-      # Return an empty tensor so we only need to check for returned tensor
-      # size being 0 as an indication of model ready.
-      return array_ops.constant([], dtype=dtypes.string)
-    else:
-      # Get a 1-D boolean tensor listing whether each variable is initialized.
-      variables_mask = math_ops.logical_not(
-          array_ops.stack(
-              [state_ops.is_variable_initialized(v) for v in var_list]))
-      # Get a 1-D string tensor containing all the variable names.
-      variable_names_tensor = array_ops.constant([s.op.name for s in var_list])
-      # Return a 1-D tensor containing all the names of uninitialized variables.
-      return array_ops.boolean_mask(variable_names_tensor, variables_mask)
+    # Run all operations on CPU
+    with ops.device("/cpu:0"):
+      if not var_list:
+        # Return an empty tensor so we only need to check for returned tensor
+        # size being 0 as an indication of model ready.
+        return array_ops.constant([], dtype=dtypes.string)
+      else:
+        # Get a 1-D boolean tensor listing whether each variable is initialized.
+        variables_mask = math_ops.logical_not(
+            array_ops.stack(
+                [state_ops.is_variable_initialized(v) for v in var_list]))
+        # Get a 1-D string tensor containing all the variable names.
+        variable_names_tensor = array_ops.constant(
+            [s.op.name for s in var_list])
+        # Return a 1-D tensor containing all the names of
+        # uninitialized variables.
+        return array_ops.boolean_mask(variable_names_tensor, variables_mask)
 
 # pylint: disable=protected-access
-ops.register_tensor_conversion_function(Variable,
-                                        Variable._TensorConversionFunction)
 Variable._OverloadAllOperators()
 
 ops.register_tensor_conversion_function(

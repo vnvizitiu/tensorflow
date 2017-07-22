@@ -118,8 +118,10 @@ set(tf_proto_text_srcs
     "tensorflow/core/framework/types.proto"
     "tensorflow/core/framework/versions.proto"
     "tensorflow/core/lib/core/error_codes.proto"
+    "tensorflow/core/protobuf/cluster.proto"
     "tensorflow/core/protobuf/config.proto"
     "tensorflow/core/protobuf/debug.proto"
+    "tensorflow/core/protobuf/device_properties.proto"
     "tensorflow/core/protobuf/rewriter_config.proto"
     "tensorflow/core/protobuf/tensor_bundle.proto"
     "tensorflow/core/protobuf/saver.proto"
@@ -145,12 +147,18 @@ file(GLOB tf_core_platform_srcs
     "${tensorflow_source_dir}/tensorflow/core/platform/*.h"
     "${tensorflow_source_dir}/tensorflow/core/platform/*.cc"
     "${tensorflow_source_dir}/tensorflow/core/platform/default/*.h"
-    "${tensorflow_source_dir}/tensorflow/core/platform/default/*.cc")
+    "${tensorflow_source_dir}/tensorflow/core/platform/default/*.cc"
+    "${tensorflow_source_dir}/tensorflow/core/framework/resource_handle.h"
+    "${tensorflow_source_dir}/tensorflow/core/framework/resource_handle.cc")
 if (NOT tensorflow_ENABLE_GPU)
   file(GLOB tf_core_platform_gpu_srcs
       "${tensorflow_source_dir}/tensorflow/core/platform/cuda_libdevice_path.*"
       "${tensorflow_source_dir}/tensorflow/core/platform/default/cuda_libdevice_path.*")
   list(REMOVE_ITEM tf_core_platform_srcs ${tf_core_platform_gpu_srcs})
+else()
+  file(GLOB tf_core_platform_srcs_exclude
+      "${tensorflow_source_dir}/tensorflow/core/platform/default/gpu_tracer.cc")
+  list(REMOVE_ITEM tf_core_platform_srcs ${tf_core_platform_srcs_exclude})
 endif()
 list(APPEND tf_core_lib_srcs ${tf_core_platform_srcs})
 
@@ -221,6 +229,10 @@ set(tf_version_srcs ${tensorflow_source_dir}/tensorflow/core/util/version_info.c
 file(GLOB_RECURSE tf_core_framework_srcs
     "${tensorflow_source_dir}/tensorflow/core/framework/*.h"
     "${tensorflow_source_dir}/tensorflow/core/framework/*.cc"
+    "${tensorflow_source_dir}/tensorflow/core/graph/edgeset.h"
+    "${tensorflow_source_dir}/tensorflow/core/graph/edgeset.cc"
+    "${tensorflow_source_dir}/tensorflow/core/graph/graph.h"
+    "${tensorflow_source_dir}/tensorflow/core/graph/graph.cc"
     "${tensorflow_source_dir}/tensorflow/core/util/*.h"
     "${tensorflow_source_dir}/tensorflow/core/util/*.cc"
     "${tensorflow_source_dir}/tensorflow/core/common_runtime/session.cc"
@@ -229,18 +241,19 @@ file(GLOB_RECURSE tf_core_framework_srcs
     "${tensorflow_source_dir}/public/*.h"
 )
 
-file(GLOB_RECURSE tf_core_framework_test_srcs
+file(GLOB_RECURSE tf_core_framework_exclude_srcs
     "${tensorflow_source_dir}/tensorflow/core/framework/*test*.h"
     "${tensorflow_source_dir}/tensorflow/core/framework/*test*.cc"
     "${tensorflow_source_dir}/tensorflow/core/framework/*testutil.h"
     "${tensorflow_source_dir}/tensorflow/core/framework/*testutil.cc"
     "${tensorflow_source_dir}/tensorflow/core/framework/*main.cc"
+    "${tensorflow_source_dir}/tensorflow/core/framework/resource_handle.cc"
     "${tensorflow_source_dir}/tensorflow/core/util/*test*.h"
     "${tensorflow_source_dir}/tensorflow/core/util/*test*.cc"
     "${tensorflow_source_dir}/tensorflow/core/util/*main.cc"
 )
 
-list(REMOVE_ITEM tf_core_framework_srcs ${tf_core_framework_test_srcs})
+list(REMOVE_ITEM tf_core_framework_srcs ${tf_core_framework_exclude_srcs})
 
 add_library(tf_core_framework OBJECT
     ${tf_core_framework_srcs}

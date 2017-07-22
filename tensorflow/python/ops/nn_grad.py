@@ -327,11 +327,12 @@ def _ReluGrad(op, grad):
 
 @ops.RegisterGradient("EluGrad")
 def _EluGradGrad(op, grad):
-  x = op.inputs[1]
+  elu_x = op.inputs[1]
   return (gen_nn_ops._elu_grad(grad, op.outputs[0]),
-          array_ops.where(
-              x < 0., gen_nn_ops._elu_grad(grad, op.outputs[0] + 1),
-              array_ops.zeros(shape=array_ops.shape(x), dtype=x.dtype)))
+          array_ops.where(elu_x < 0,
+                          grad * op.inputs[0],
+                          array_ops.zeros(shape=array_ops.shape(elu_x),
+                                          dtype=elu_x.dtype)))
 
 
 @ops.RegisterGradient("Relu6")
@@ -347,6 +348,19 @@ def _EluGrad(op, grad):
 @ops.RegisterGradient("Softplus")
 def _SoftplusGrad(op, grad):
   return gen_nn_ops._softplus_grad(grad, op.inputs[0])
+
+
+@ops.RegisterGradient("SoftplusGrad")
+def _SoftplusGradGrad(op, grad):
+  # Let:
+  #   y = tf.nn.softplus(x)
+  #   dx = gen_nn_ops._softplus_grad(dy, x) = dy / (1 + exp(-x))
+  # This op computes (ddy, d2x) from op.inputs == [dy, x] and grad == ddx.
+  dy, x = op.inputs
+  with ops.control_dependencies([grad.op]):
+    ddy = gen_nn_ops._softplus_grad(grad, x)  # pylint: disable=protected-access
+    d2x = grad * dy / (math_ops.exp(-x) + 2.0 + math_ops.exp(x))
+    return (ddy, d2x)
 
 
 @ops.RegisterGradient("Softsign")

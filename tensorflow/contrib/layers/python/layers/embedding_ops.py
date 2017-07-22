@@ -100,7 +100,13 @@ def safe_embedding_lookup_sparse(embedding_weights,
     logging.warn("The default value of combiner will change from \"mean\" "
                  "to \"sqrtn\" after 2016/11/01.")
     combiner = "mean"
-  if embedding_weights is None or len(embedding_weights) < 1:
+  if embedding_weights is None:
+    raise ValueError("Missing embedding_weights %s." % embedding_weights)
+  if isinstance(embedding_weights, variables.PartitionedVariable):
+    embedding_weights = list(embedding_weights)  # get underlying Variables.
+  if not isinstance(embedding_weights, list):
+    embedding_weights = [embedding_weights]
+  if len(embedding_weights) < 1:
     raise ValueError("Missing embedding_weights %s." % embedding_weights)
 
   dtype = sparse_weights.dtype if sparse_weights is not None else None
@@ -865,7 +871,7 @@ def _embedding_lookup_with_distributed_aggregation(params,
           p_segment_ids = array_ops.gather(segment_ids, pindices[p])
           # Number the p_segment_ids to meet segment_sum's requirements. Note
           # that unique_p_segment_ids contains unique segment ids of this
-          # partiton and these ids' order is unchanged.
+          # partition and these ids' order is unchanged.
           unique_p_segment_ids, unique_p_segment_idx = array_ops.unique(
               p_segment_ids)
           partitioned_segment_ids.append(unique_p_segment_ids)

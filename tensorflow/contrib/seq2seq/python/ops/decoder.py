@@ -99,12 +99,15 @@ class Decoder(object):
       name: Name scope for any created operations.
 
     Returns:
-      `(outputs, next_state, next_inputs, finished)`: `outputs` is an instance
-      of BasicDecoderOutput, `next_state` is a (structure of) state tensors and
-      TensorArrays, `next_inputs` is the tensor that should be used as input for
+      `(outputs, next_state, next_inputs, finished)`: `outputs` is an object
+      containing the decoder output, `next_state` is a (structure of) state tensors
+      and TensorArrays, `next_inputs` is the tensor that should be used as input for
       the next step, `finished` is a boolean tensor telling whether the sequence
       is complete, for each sequence in the batch.
     """
+    raise NotImplementedError
+
+  def finalize(self, outputs, final_state, sequence_lengths):
     raise NotImplementedError
 
 
@@ -164,7 +167,7 @@ def dynamic_decode(decoder,
     raise TypeError("Expected decoder to be type Decoder, but saw: %s" %
                     type(decoder))
 
-  with variable_scope.variable_scope(scope or "decoder") as varscope:
+  with variable_scope.variable_scope(scope, "decoder") as varscope:
     # Properly cache variable values inside the while_loop
     if varscope.caching_device is None:
       varscope.set_caching_device(lambda op: op.device)
@@ -288,9 +291,11 @@ def dynamic_decode(decoder,
 
     final_outputs = nest.map_structure(lambda ta: ta.stack(), final_outputs_ta)
 
-    if hasattr(decoder, "finalize"):
+    try:
       final_outputs, final_state = decoder.finalize(
           final_outputs, final_state, final_sequence_lengths)
+    except NotImplementedError:
+      pass
 
     if not output_time_major:
       final_outputs = nest.map_structure(_transpose_batch_time, final_outputs)

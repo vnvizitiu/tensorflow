@@ -21,6 +21,7 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/device_mgr.h"
 #include "tensorflow/core/common_runtime/dma_helper.h"
 #include "tensorflow/core/common_runtime/gpu/gpu_util.h"
+#include "tensorflow/core/common_runtime/gpu/process_state.h"
 #include "tensorflow/core/distributed_runtime/rendezvous_mgr_interface.h"
 #include "tensorflow/core/distributed_runtime/session_mgr.h"
 #include "tensorflow/core/framework/rendezvous.h"
@@ -271,6 +272,11 @@ RdmaChannel::RdmaChannel(const RdmaAdapter* adapter, const string local_name,
     self_.lid = attr.lid;
     self_.qpn = qp_->qp_num;
     self_.psn = static_cast<uint32_t>(random::New64()) & 0xffffff;
+    union ibv_gid gid;
+    CHECK(!ibv_query_gid(adapter_->context_, (uint8_t)1, 0, &gid))
+        << "Query gid";
+    self_.snp = gid.global.subnet_prefix;
+    self_.iid = gid.global.interface_id;
   }
 
   // create message and ack buffers, then initialize the tables.
@@ -320,11 +326,15 @@ void RdmaChannel::SetRemoteAddress(const RdmaAddress& ra, bool override) {
     remote_.lid = ra.lid;
     remote_.qpn = ra.qpn;
     remote_.psn = ra.psn;
+    remote_.snp = ra.snp;
+    remote_.iid = ra.iid;
     remote_set_ = true;
   } else {
     CHECK(remote_.lid == ra.lid);
     CHECK(remote_.qpn == ra.qpn);
     CHECK(remote_.psn == ra.psn);
+    CHECK(remote_.snp == ra.snp);
+    CHECK(remote_.iid == ra.iid);
   }
 }
 
@@ -467,12 +477,20 @@ void RdmaChannel::Connect(const RdmaAddress& remoteAddr) {
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(ibv_qp_attr));
     attr.qp_state = IBV_QPS_RTR;
-    attr.path_mtu = IBV_MTU_4096;
+    struct ibv_port_attr port_attr;
+    CHECK(!ibv_query_port(adapter_->context_, (uint8_t)1, &port_attr))
+        << "Query port failed";
+    // This assumes both QP's ports are configured with the same MTU
+    attr.path_mtu = port_attr.active_mtu;
     attr.dest_qp_num = remoteAddr.qpn;
     attr.rq_psn = remoteAddr.psn;
     attr.max_dest_rd_atomic = 1;
     attr.min_rnr_timer = 12;
-    attr.ah_attr.is_global = 0;
+    attr.ah_attr.is_global = 1;
+    attr.ah_attr.grh.dgid.global.subnet_prefix = remoteAddr.snp;
+    attr.ah_attr.grh.dgid.global.interface_id = remoteAddr.iid;
+    attr.ah_attr.grh.flow_label = 0;
+    attr.ah_attr.grh.hop_limit = 255;
     attr.ah_attr.dlid = remoteAddr.lid;
     attr.ah_attr.sl = 0;
     attr.ah_attr.src_path_bits = 0;
@@ -666,7 +684,6 @@ void RdmaTensorBuffer::SendNextItem() {
                          << " error message: " << status.error_message();
       size_t buffer_size = RdmaMessage::kMessageTotalBytes;
       size_t tensor_bytes = 0;
-      TensorProto proto;
       // Figures out which device the tensor is hosted on.
       Device* src_dev = nullptr;
       Status s = channel_->adapter_->worker_env_->device_mgr->LookupDevice(
@@ -686,21 +703,47 @@ void RdmaTensorBuffer::SendNextItem() {
       CHECK(s.ok()) << "dst device not found";
       AllocatorAttributes dst_alloc_attr;
       dst_alloc_attr.set_on_host(true);
+
+      bool can_memcpy = DataTypeCanUseMemcpy(in.dtype());
       // string tensor needs to be serialized
+      Tensor copy;
+      StringPiece copy_buf;
+      TensorProto proto;
       if (src_dev->tensorflow_gpu_device_info() &&
           (!send_args.alloc_attrs.on_host())) {
         CHECK(send_args.device_context)
-            << "send dev name: " << src_dev->name()
-            << " gpu_info: " << src_dev->tensorflow_gpu_device_info();
-        // "val" is on a GPU. Uses GPUUtil to fill the proto.
-        s = VerbsUtil::SetProtoFromGPUSync(
-            in, src_dev, send_args.device_context, &proto, is_dead);
-        CHECK(s.ok()) << "set proto from gpu sync";
+          << "send dev name: " << src_dev->name()
+          << " gpu_info: " << src_dev->tensorflow_gpu_device_info();
+
+        if (can_memcpy) {
+          AllocatorAttributes host_alloc_attrs;
+          host_alloc_attrs.set_gpu_compatible(true);
+          host_alloc_attrs.set_on_host(true);
+          Allocator* alloc = ProcessState::singleton()->GetCUDAHostAllocator(0);
+          copy = Tensor(alloc, in.dtype(), in.shape());
+          s = VerbsUtil::CopyGPUTensorToCPUSync(
+              src_dev, send_args.device_context, &in, &copy);
+          CHECK(s.ok()) << "copy tensor from gpu sync";
+          copy_buf = copy.tensor_data();
+        } else {
+          // "val" is on a GPU. Uses GPUUtil to fill the proto.
+          s = VerbsUtil::SetProtoFromGPUSync(
+              in, src_dev, send_args.device_context, &proto, is_dead);
+          CHECK(s.ok()) << "set proto from gpu sync";
+        }
       } else {
         // tensor is in CPU memory.
-        in.AsProtoTensorContent(&proto);
+        if (can_memcpy) {
+          copy_buf = in.tensor_data();
+        } else {
+          in.AsProtoTensorContent(&proto);
+        }
       }
-      tensor_bytes = proto.ByteSize();
+      if (can_memcpy) {
+        tensor_bytes = in.TotalBytes();
+      } else {
+        tensor_bytes = proto.ByteSize();
+      }
       // maybe some margin for string tensor?
       buffer_size += tensor_bytes;
       // prepare message
@@ -718,8 +761,8 @@ void RdmaTensorBuffer::SendNextItem() {
           (buffer_size > size_ && local_status_ == idle &&
            remote_status_ == idle)) {
         if ((local_status_ != none) && (buffer_size > size_)) {
-          CHECK(rm.data_type_ == DT_STRING)
-              << "Only string tensor allows to change size";
+          VLOG(2) << "Extend RDMA buffer from " << size_ << " to "
+                  << buffer_size;
         }
         CreateCPUBuffer(buffer_size, false);
         mu_.unlock();
@@ -739,11 +782,13 @@ void RdmaTensorBuffer::SendNextItem() {
         // local/remote_status_ won't be set back to idle
         // unitl Write() is successful
         mu_.unlock();
-        CHECK((buffer_size == size_ && rm.data_type_ != DT_STRING) ||
-              (buffer_size <= size_ && rm.data_type_ == DT_STRING))
-            << "tensor and buffer size do not agree!"
-            << " buffer_size = " << size_
-            << " requested tensor size = " << buffer_size << in.DebugString();
+        if (!((buffer_size == size_ && rm.data_type_ != DT_STRING) ||
+              (buffer_size <= size_ && rm.data_type_ == DT_STRING))) {
+          VLOG(2) << "Tensor and buffer size do not agree,"
+                  << " buffer_size = " << size_
+                  << " requested tensor size = "
+                  << buffer_size << in.DebugString();
+        }
         uint32_t imm_data = LookupBufferIndex(key);
         rm.type_ = RDMA_MESSAGE_TENSOR_WRITE;
         string message = RdmaMessage::CreateMessage(rm);
@@ -754,7 +799,16 @@ void RdmaTensorBuffer::SendNextItem() {
               static_cast<void*>(static_cast<char*>(buffer_) +
                                  RdmaMessage::kTensorBufferStartIndex);
           CHECK(tensor_bytes + RdmaMessage::kTensorBufferStartIndex <= size_);
-          proto.SerializeToArray(output, tensor_bytes);
+          if (can_memcpy) {
+            CHECK(copy_buf.size() == tensor_bytes)
+               << "unexpected tensor size: "
+               << copy_buf.size()
+               << " != "
+               << tensor_bytes;
+            memcpy(output, copy_buf.data(), tensor_bytes);
+          } else {
+            proto.SerializeToArray(output, tensor_bytes);
+          }
         } else {
           buffer_size = RdmaMessage::kMessageTotalBytes;
         }
@@ -765,11 +819,8 @@ void RdmaTensorBuffer::SendNextItem() {
         EnqueueItem(key_with_step_id);
       }
     };
-    // Use default session (legacy_session_)
-    // TODO use WorkerSessionForSession
-    // need to pass in session handle
-    channel_->adapter_->worker_env_->session_mgr->LegacySession()
-        ->rendezvous_mgr->RecvLocalAsync(step_id, parsed, cb);
+    channel_->adapter_->worker_env_->rendezvous_mgr->RecvLocalAsync(step_id,
+                                                                    parsed, cb);
   }
 }
 

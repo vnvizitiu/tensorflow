@@ -21,11 +21,12 @@ limitations under the License.
 #include <list>
 #include <utility>
 
+#include "external/llvm/include/llvm/ExecutionEngine/ExecutionEngine.h"
+#include "external/llvm/include/llvm/ExecutionEngine/SectionMemoryManager.h"
 #include "external/llvm/include/llvm/IR/Mangler.h"
 #include "external/llvm/include/llvm/Support/CodeGen.h"
 #include "external/llvm/include/llvm/Support/Host.h"
 #include "tensorflow/compiler/xla/ptr_util.h"
-#include "tensorflow/compiler/xla/service/cpu/compiler_functor.h"
 #include "tensorflow/compiler/xla/service/cpu/cpu_runtime.h"
 #include "tensorflow/compiler/xla/service/cpu/cpu_runtime_avx.h"
 #include "tensorflow/compiler/xla/service/cpu/cpu_runtime_sse4_1.h"
@@ -55,44 +56,15 @@ std::string CanonicalizeSymbol(const std::string &name) {
 // A simple SymbolResolver that delegates to the host dynamic linker.
 struct SimpleResolver : public llvm::JITSymbolResolver {
   llvm::JITSymbol findSymbol(const std::string &name) override {
-    void *func_addr = nullptr;
-
     std::string canonical_name = CanonicalizeSymbol(name);
-    if (canonical_name == runtime::kEigenMatmulF32SymbolName) {
-      func_addr = reinterpret_cast<void *>(__xla_cpu_runtime_EigenMatMulF32);
-    } else if (canonical_name ==
-               runtime::kEigenSingleThreadedMatmulF32SymbolName) {
-      func_addr = reinterpret_cast<void *>(
-          __xla_cpu_runtime_EigenSingleThreadedMatMulF32);
-    } else if (canonical_name == runtime::kEigenConvF32SymbolName) {
-      func_addr = reinterpret_cast<void *>(__xla_cpu_runtime_EigenConvF32);
-    } else if (canonical_name ==
-               runtime::kEigenSingleThreadedConvF32SymbolName) {
-      func_addr = reinterpret_cast<void *>(
-          __xla_cpu_runtime_EigenSingleThreadedConvF32);
-    } else if (canonical_name ==
-               runtime::kAcquireInfeedBufferForDequeueSymbolName) {
-      func_addr = reinterpret_cast<void *>(
-          __xla_cpu_runtime_AcquireInfeedBufferForDequeue);
-    } else if (canonical_name ==
-               runtime::kReleaseInfeedBufferAfterDequeueSymbolName) {
-      func_addr = reinterpret_cast<void *>(
-          __xla_cpu_runtime_ReleaseInfeedBufferAfterDequeue);
-    } else if (canonical_name == runtime::kExpV4F32) {
-      func_addr = reinterpret_cast<void *>(runtime::ExpV4F32);
-    } else if (canonical_name == runtime::kExpV8F32) {
-      func_addr = reinterpret_cast<void *>(runtime::ExpV8F32);
-    } else if (canonical_name == runtime::kLogV4F32) {
-      func_addr = reinterpret_cast<void *>(runtime::LogV4F32);
-    } else if (canonical_name == runtime::kLogV8F32) {
-      func_addr = reinterpret_cast<void *>(runtime::LogV8F32);
-    } else if (canonical_name == runtime::kTanhV4F32) {
-      func_addr = reinterpret_cast<void *>(runtime::TanhV4F32);
-    } else if (canonical_name == runtime::kTanhV8F32) {
-      func_addr = reinterpret_cast<void *>(runtime::TanhV8F32);
-    } else {
-      func_addr = dlsym(RTLD_DEFAULT, canonical_name.c_str());
-    }
+    bool must_be_builtin =
+        tensorflow::StringPiece(canonical_name.c_str(), canonical_name.size())
+            .starts_with(runtime::kXlaCpuRuntimeSymbolPrefix);
+
+    void *func_addr = must_be_builtin
+                          ? runtime::ResolveSymbol(
+                                {canonical_name.c_str(), canonical_name.size()})
+                          : dlsym(RTLD_DEFAULT, canonical_name.c_str());
 
     if (func_addr == nullptr) {
       return nullptr;
@@ -133,15 +105,17 @@ llvm::StringRef GetHostCpuName() {
 
 CompilerFunctor::VectorIntrinsics GetAvailableIntrinsics() {
   CompilerFunctor::VectorIntrinsics intrinsics;
-  intrinsics.sse_intrinsics = (&runtime::ExpV4F32 != nullptr);
-  intrinsics.avx_intrinsics = (&runtime::ExpV8F32 != nullptr);
+  intrinsics.sse_intrinsics = (&runtime::__xla_cpu_runtime_ExpV4F32 != nullptr);
+  intrinsics.avx_intrinsics = (&runtime::__xla_cpu_runtime_ExpV8F32 != nullptr);
   return intrinsics;
 }
 
 }  // namespace
 
 SimpleOrcJIT::SimpleOrcJIT(const llvm::TargetOptions &target_options,
-                           llvm::CodeGenOpt::Level opt_level)
+                           llvm::CodeGenOpt::Level opt_level,
+                           CompilerFunctor::ModuleHook pre_optimization_hook,
+                           CompilerFunctor::ModuleHook post_optimization_hook)
     : target_machine_(
           CHECK_NOTNULL(llvm::EngineBuilder()
                             .setTargetOptions(target_options)
@@ -152,30 +126,30 @@ SimpleOrcJIT::SimpleOrcJIT(const llvm::TargetOptions &target_options,
                                 /*MAttrs=*/DetectMachineAttributes()))),
       disassembler_(*target_machine_),
       data_layout_(target_machine_->createDataLayout()),
+      object_layer_(
+          [] { return std::make_shared<llvm::SectionMemoryManager>(); }),
       compile_layer_(object_layer_,
                      CompilerFunctor(target_machine_.get(), &disassembler_,
-                                     opt_level, GetAvailableIntrinsics())) {
+                                     opt_level, GetAvailableIntrinsics(),
+                                     std::move(pre_optimization_hook),
+                                     std::move(post_optimization_hook))) {
   VLOG(1) << "CPU target: " << target_machine_->getTargetCPU().str()
           << " features: " << target_machine_->getTargetFeatureString().str();
 }
 
 SimpleOrcJIT::ModuleHandleT SimpleOrcJIT::AddModule(
     std::unique_ptr<llvm::Module> module) {
-  // The Orc API adds a whole iterable "set" of modules, so we wrap the module
-  // in a vector.
-  std::vector<std::unique_ptr<llvm::Module>> module_set;
-  module_set.push_back(std::move(module));
-  auto handle = compile_layer_.addModuleSet(
-      std::move(module_set), MakeUnique<llvm::SectionMemoryManager>(),
-      MakeUnique<SimpleResolver>());
+  auto handle = cantFail(compile_layer_.addModule(
+      std::move(module), MakeUnique<SimpleResolver>()));
   module_handles_.push_back(handle);
   return handle;
 }
 
 void SimpleOrcJIT::RemoveModule(SimpleOrcJIT::ModuleHandleT handle) {
   module_handles_.erase(
-      std::remove(module_handles_.begin(), module_handles_.end(), handle));
-  compile_layer_.removeModuleSet(handle);
+      std::remove(module_handles_.begin(), module_handles_.end(), handle),
+      module_handles_.end());
+  cantFail(compile_layer_.removeModule(handle));
 }
 
 llvm::JITSymbol SimpleOrcJIT::FindSymbol(const std::string &name) {

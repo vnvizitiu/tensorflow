@@ -60,6 +60,7 @@ cc_library(
     srcs = [
         "add_default_attributes.cc",
         "backports.cc",
+        "fake_quantize_training.cc",
         "fold_batch_norms.cc",
         "fold_constants_lib.cc",
         "fold_old_batch_norms.cc",
@@ -97,6 +98,7 @@ cc_library(
         "//tensorflow/core:tensorflow",
     ] + if_not_windows([
         "//tensorflow/core/kernels:quantized_ops",
+        "//tensorflow/core/kernels:remote_fused_graph_rewriter_transform",
         "//tensorflow/core/kernels/hexagon:hexagon_rewriter_transform",
     ]),
     alwayslink = 1,
@@ -108,6 +110,7 @@ tf_cc_test(
     srcs = [
         "add_default_attributes_test.cc",
         "backports_test.cc",
+        "fake_quantize_training_test.cc",
         "fold_batch_norms_test.cc",
         "fold_constants_test.cc",
         "fold_old_batch_norms_test.cc",
@@ -216,6 +219,7 @@ cc_library(
         "//tensorflow/core:framework",
         "//tensorflow/core:framework_internal",
         "//tensorflow/core:lib",
+        "//tensorflow/core:protos_all_cc",
     ],
 )
 
@@ -238,7 +242,6 @@ cc_binary(
     deps = [
         ":transform_utils",
         "//tensorflow/core:core_cpu_internal",
-        "//tensorflow/core:framework",
         "//tensorflow/core:framework_internal",
         "//tensorflow/core:lib",
     ],
@@ -248,7 +251,12 @@ py_library(
     name = "transform_graph_py",
     srcs = ["__init__.py"],
     srcs_version = "PY2AND3",
-    deps = ["//tensorflow/python:pywrap_tensorflow"],
+    deps = [
+        "//tensorflow/core:protos_all_py",
+        "//tensorflow/python:errors",
+        "//tensorflow/python:pywrap_tensorflow",
+        "//tensorflow/python:util",
+    ],
 )
 
 tf_py_test(
